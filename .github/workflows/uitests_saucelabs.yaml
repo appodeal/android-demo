@@ -1,6 +1,10 @@
 name: UITest on SauceLabs
 
 on:
+  pull_request:
+    types: [ opened, edited, reopened, assigned, synchronize, ready_for_review ]
+    branches:
+      - '**'
   workflow_dispatch:
     inputs:
       device:
@@ -42,9 +46,11 @@ jobs:
 
       - name: Build with Gradle
         working-directory: ${{ github.workspace }}/appodeal-android-sdk
-        run: ./gradlew :banner:assembleDebug
+        run: |
+          ./gradlew updateVersionName -PnewVersion=${{ env.GITHUB_RUN_NUMBER }} || true      
+          ./gradlew :banner:assembleDebug
 
-      - name: save debug build for aws
+      - name: save debug build for Saucelabs
         uses: actions/upload-artifact@v4
         with:
           name: banner-debug.apk
@@ -57,10 +63,134 @@ jobs:
           --request POST 'https://api.eu-central-1.saucelabs.com/v1/storage/upload' \
           --form 'payload=@"appodeal-android-sdk/banner/build/outputs/apk/debug/banner-debug.apk"' \
           --form 'name="banner-debug.apk"' \
-          --form 'description="APD demo \n ${GITHUB_REF_NAME}"'
+          --form 'description="APD demo ${{ env.GITHUB_REF_NAME }} launch by ${{ env.GITHUB_RUN_ID }}"'
 
-#          GITHUB_REF_NAME=feature/auto_test
-#  GITHUB_RUN_ID=10653731636
-#  GITHUB_REPOSITORY=appodeal/appodeal-android-sdk
-#  https://github.com/appodeal/appodeal-android-sdk/actions/runs/10653731636
-#  GITHUB_TRIGGERING_ACTOR=johnlitvinov
+  tests:
+    name: run ui tests on SauceLabs with appium
+    needs: build
+    runs-on: ${{ github.event.inputs.runner || 'autotestdebug' }}
+    timeout-minutes: 30
+    steps:
+      - name: Print Env Variables
+        run: env
+        working-directory: ${{ github.workspace }}
+
+      - name: checkout source code of application
+        uses: actions/checkout@v4
+        with:
+          path: 'SDK-Auto-Test'
+          clean: true
+          repository: 'appodeal/SDK-Auto-Test'
+          ref: 'aws'
+          token: ${{ secrets.UITESTREPOACCESS }}
+
+      - name: Clean all tests reports
+        run: | 
+          rm -rf ${{ github.workspace }}/SDK-Auto-Test/target/allure-results || true
+          rm -rf ${{ github.workspace }}/SDK-Auto-Test/allure-report || true
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Launch tests on SauceLabs
+        working-directory: ${{ github.workspace }}/SDK-Auto-Test
+        run: |
+          mvn clean
+          sleep 10
+          mvn -Dtest=AndroidAppTest test
+
+      - name: save Allure result
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: allure-results
+          path: ${{ github.workspace }}/SDK-Auto-Test/target/allure-results
+
+      - name: convert allure-result to allure-report
+        if: always()
+        run: allure generate ${{ github.workspace }}/SDK-Auto-Test/target/allure-results --clean -o ${{ github.workspace }}/SDK-Auto-Test/allure-report
+
+      - name: save Allure report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: allure-report
+          path: ${{ github.workspace }}/SDK-Auto-Test/allure-report
+
+      - name: notification to Slack
+        if: always()
+        working-directory: ${{ github.workspace }}/SDK-Auto-Test
+        run: |
+          chmod +x ${{ github.workspace }}/SDK-Auto-Test/allure_notifications/allure-notifications-4.8.0.jar   
+          jq '.base.reportLink = "http://appodeal.github.io/appodeal-android-sdk/${{ github.run_number }}"' ${{ github.workspace }}/SDK-Auto-Test/allure_notifications/config.json > ${{ github.workspace }}/SDK-Auto-Test/allure_notifications/temp.json && mv ${{ github.workspace }}/SDK-Auto-Test/allure_notifications/temp.json ${{ github.workspace }}/SDK-Auto-Test/allure_notifications/config.json
+          java "-DconfigFile=${{ github.workspace }}/SDK-Auto-Test/allure_notifications/config.json" -jar ${{ github.workspace }}/SDK-Auto-Test/allure_notifications/allure-notifications-4.8.0.jar
+
+      - name: Adding summary
+        if: ${{ always() }}
+        run: |
+          echo "### Results of test execution :fire:" >> $GITHUB_STEP_SUMMARY
+          echo "Launch: ${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "Device: ${{ github.event.inputs.device }}" >> $GITHUB_STEP_SUMMARY
+          echo "Build agent: ${{ github.event.inputs.runner }}" >> $GITHUB_STEP_SUMMARY
+          echo "Allure report link: http://appodeal.github.io/appodeal-android-sdk/${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY   
+
+  upload:
+    name: upload allure to gp-pages
+    needs: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Print Env Variables
+        run: env
+        working-directory: ${{ github.workspace }}
+
+      - name: Get Allure history
+        uses: actions/checkout@v4
+        if: always()
+        continue-on-error: true
+        with:
+          ref: gh-pages
+          path: gh-pages
+
+      - name: download allure results
+        uses: actions/download-artifact@v4
+        with:
+          name: allure-results
+          path: allure-results
+
+      - name: download allure report
+        uses: actions/download-artifact@v4
+        with:
+          name: allure-report
+          path: allure-report
+
+      - name: upload allure-result to gh-pages
+        uses: simple-elf/allure-report-action@master
+        if: always()
+        id: allure-report
+        with:
+          allure_results: allure-results
+          gh_pages: gh-pages
+          allure_report: allure-report
+          allure_history: allure-history
+
+      - name: Deploy report to Github Pages
+        if: always()
+        uses: peaceiris/actions-gh-pages@v2
+        env:
+          PERSONAL_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUBLISH_BRANCH: gh-pages
+          PUBLISH_DIR: allure-history
+
+      - name: Post the link to the report
+        if: always()
+        uses: guibranco/github-status-action-v2@v1.1.13
+        with:
+          authToken: ${{secrets.GITHUB_TOKEN}}
+          context: 'Test report'
+          state: 'success'
+          sha: ${{ github.sha }}
+          target_url: http://appodeal.github.io/appodeal-android-sdk/${{ github.run_number }}

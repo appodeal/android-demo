@@ -13,7 +13,7 @@ android {
         minSdkVersion 21
         targetSdkVersion 34
         versionCode 1
-        versionName "1.0"
+        versionName "1.0.0"
     }
     buildTypes {
         release {
@@ -31,6 +31,16 @@ android {
     buildFeatures {
         viewBinding true
         buildConfig true
+    }
+}
+
+task updateVersionCode {
+    doLast {
+        def versionFile = file('build.gradle')
+        def newVersionCode = project.hasProperty('newversionCode') ? project.newversionCode : 1
+        def content = versionFile.getText('UTF-8')
+        def updatedContent = content.replaceAll(/versionCode \d+/, 'versionCode ' + newVersionCode)
+        versionFile.write(updatedContent, 'UTF-8')
     }
 }
 
